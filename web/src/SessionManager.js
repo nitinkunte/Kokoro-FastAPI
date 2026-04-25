@@ -143,8 +143,7 @@ AudioService.prototype.streamAudio = async function(text, voice, speed, onProgre
         const apiUrl = await config.getApiUrl('/enhanced/v1/audio/speech/progress_stream');
         
         if (!isResume) {
-            sessionStorage.removeItem('kokoro-progress-index');
-            document.getElementById('resume-btn').style.display = 'none';
+            sessionStorage.setItem('kokoro-progress-index', '0');
             this.audioBlobParts = [];
         } else {
             this.audioBlobParts = this.audioBlobParts || [];
@@ -246,10 +245,8 @@ AudioService.prototype.streamAudio = async function(text, voice, speed, onProgre
                                 if (data.chunk_index === -1) {
                                     // Complete
                                     sessionStorage.removeItem('kokoro-progress-index');
-                                    document.getElementById('resume-btn').style.display = 'none';
                                 } else {
                                     sessionStorage.setItem('kokoro-progress-index', data.chunk_index.toString());
-                                    document.getElementById('resume-btn').style.display = 'inline-flex';
                                 }
                                 
                                 receivedChunks++;
@@ -315,12 +312,49 @@ const originalAppSetupEvents = App.prototype.setupEventListeners;
 App.prototype.setupEventListeners = function() {
     originalAppSetupEvents.call(this);
     
-    // Add Resume listener
     const resumeBtn = document.getElementById('resume-btn');
     if (resumeBtn) {
         resumeBtn.addEventListener('click', () => {
-             this.generateSpeech(true);
+             const isPaused = resumeBtn.textContent === 'Resume';
+             if (isPaused) {
+                 this.generateSpeech(true);
+             } else {
+                 this.audioService.cancel();
+                 resumeBtn.textContent = 'Resume';
+                 this.setGenerating(false);
+             }
         });
+    }
+    
+    const cancelBtn = document.getElementById('cancel-btn');
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', () => {
+             sessionStorage.removeItem('kokoro-progress-index');
+             // Original event already triggers audioService.cancel() and setGenerating(false)
+             this.setGenerating(false); // Force update our overridden visual logic
+        });
+    }
+};
+
+// Patch setGenerating to manage the flex action container visibility
+const originalSetGenerating = App.prototype.setGenerating;
+App.prototype.setGenerating = function (isGenerating) {
+    originalSetGenerating.call(this, isGenerating);
+    
+    const actionContainer = document.getElementById('action-buttons-container');
+    const cancelBtn = document.getElementById('cancel-btn');
+    const resumeBtn = document.getElementById('resume-btn');
+    
+    if (actionContainer && cancelBtn && resumeBtn) {
+        const hasProgress = sessionStorage.getItem('kokoro-progress-index') !== null;
+        if (isGenerating || hasProgress) {
+            actionContainer.style.display = 'flex';
+            cancelBtn.style.display = 'inline-block';
+            resumeBtn.style.display = 'inline-block';
+            resumeBtn.textContent = isGenerating ? 'Pause' : 'Resume';
+        } else {
+            actionContainer.style.display = 'none';
+        }
     }
 };
 
@@ -367,10 +401,15 @@ App.prototype.generateSpeech = async function(isResume = false) {
 // Check existance of previous pause state on UI load!
 document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => {
+        const appInstance = window.app || null; 
         const idx = sessionStorage.getItem('kokoro-progress-index');
         if (idx && parseInt(idx, 10) > 0) {
-            const btn = document.getElementById('resume-btn');
-            if (btn) btn.style.display = 'inline-flex';
+            const container = document.getElementById('action-buttons-container');
+            const resumeBtn = document.getElementById('resume-btn');
+            if (container && resumeBtn) {
+                container.style.display = 'flex';
+                resumeBtn.textContent = 'Resume';
+            }
         }
     }, 500);
 });
