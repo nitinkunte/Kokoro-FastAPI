@@ -94,3 +94,9 @@ pyproject.toml.bkp
 examples/assorted_checks/test_silence/out/*
 playwright-report/
 test-results/
+kokoro-web/src/.DS_Store
+ui/.DS_Store
+web/src/.DS_Store
+web/tests/.DS_Store
+web/.DS_Store
+.DS_Store
