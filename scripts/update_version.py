@@ -9,8 +9,6 @@ in pyproject.toml, the Helm chart, and README.md.
 import re
 from pathlib import Path
 
-import yaml
-
 # Get the project root directory
 ROOT_DIR = Path(__file__).parent.parent
 
@@ -31,7 +29,7 @@ def update_pyproject(version: str):
     try:
         content = PYPROJECT_FILE.read_text()
         # Regex to find and capture current version = "X.Y.Z" under [project]
-        pattern = r'(^\[project\]\s*(?:.*\s)*?version\s*=\s*)"([^"]+)"'
+        pattern = r'(^\[project\]\s*(?:.*\n)*?version\s*=\s*)"([^"]+)"'
         match = re.search(pattern, content, flags=re.MULTILINE)
 
         if not match:

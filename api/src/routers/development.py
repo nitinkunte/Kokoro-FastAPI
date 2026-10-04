@@ -1,32 +1,39 @@
 import base64
-import json
-import os
-import re
-from pathlib import Path
-from typing import AsyncGenerator, List, Tuple, Union
 
-import numpy as np
-import torch
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from kokoro import KPipeline
 from loguru import logger
 
 from ..core.config import settings
-from ..inference.base import AudioChunk
-from ..services.audio import AudioNormalizer, AudioService
+from ..services.audio import AudioNormalizer
 from ..services.streaming_audio_writer import StreamingAudioWriter
-from ..services.temp_manager import TempFileWriter
-from ..services.text_processing import smart_split
+from ..services.text_processing.text_processor import (
+    check_pause_budget,
+    check_speakable,
+)
 from ..services.tts_service import TTSService
-from ..structures import CaptionedSpeechRequest, CaptionedSpeechResponse, WordTimestamp
+from ..structures import (
+    CaptionedSpeechRequest,
+    CaptionedSpeechResponse,
+    DialogueRequest,
+    OpenAISpeechRequest,
+)
 from ..structures.custom_responses import JSONStreamingResponse
 from ..structures.text_schemas import (
     GenerateFromPhonemesRequest,
     PhonemeRequest,
     PhonemeResponse,
 )
-from .openai_compatible import process_and_validate_voices, stream_audio_chunks
+from .openai_compatible import (
+    apply_alias_rate,
+    create_speech,
+    process_and_validate_voice_tags,
+    process_and_validate_voices,
+    require_voice_tags_enabled,
+    stream_audio_chunks,
+)
+from .ssml import apply_ssml
 
 router = APIRouter(tags=["text processing"])
 
@@ -53,7 +60,9 @@ async def phonemize_text(request: PhonemeRequest) -> PhonemeResponse:
             raise ValueError("Text cannot be empty")
 
         # Initialize Kokoro pipeline in quiet mode (no model)
-        pipeline = KPipeline(lang_code=request.language, model=False)
+        pipeline = KPipeline(
+            lang_code=request.language, repo_id=settings.model_repo_id, model=False
+        )
 
         # Get first result from pipeline (we only need one since we're not chunking)
         for result in pipeline(request.text):
@@ -64,9 +73,14 @@ async def phonemize_text(request: PhonemeRequest) -> PhonemeResponse:
 
         raise ValueError("Failed to generate phonemes")
     except ValueError as e:
-        logger.error(f"Error in phoneme generation: {str(e)}")
+        logger.warning(f"Invalid phoneme request: {str(e)}")
         raise HTTPException(
-            status_code=500, detail={"error": "Server error", "message": str(e)}
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "message": str(e),
+                "type": "invalid_request_error",
+            },
         )
     except Exception as e:
         logger.error(f"Error in phoneme generation: {str(e)}")
@@ -114,16 +128,15 @@ async def generate_from_phonemes(
                     final_bytes = writer.write_chunk(finalize=True)
                     if final_bytes:
                         yield final_bytes
-                        writer.close()
                 else:
                     raise ValueError("Failed to generate audio data")
 
             except Exception as e:
                 logger.error(f"Error in audio generation: {str(e)}")
-                # Clean up writer on error
-                writer.close()
                 # Re-raise the original exception
                 raise
+            finally:
+                writer.close()
 
         return StreamingResponse(
             generate_chunks(),
@@ -158,6 +171,42 @@ async def generate_from_phonemes(
         )
 
 
+@router.post("/dev/dialogue")
+async def create_dialogue(
+    request: DialogueRequest,
+    client_request: Request,
+):
+    """Generate multi-speaker audio from an ordered list of turns.
+
+    Thin wrapper over /v1/audio/speech: turns are rendered to the existing
+    inline [voice:...] and [pause:Xs] tags, so streaming, formats, and
+    download links behave identically.
+    """
+    require_voice_tags_enabled()
+
+    speech_request = OpenAISpeechRequest(
+        model=request.model,
+        input=request.to_tagged_input(),
+        voice=request.turns[0].voice,
+        response_format=request.response_format,
+        download_format=request.download_format,
+        speed=request.speed,
+        stream=request.stream,
+        return_download_link=request.return_download_link,
+        return_timing=request.return_timing,
+        lang_code=request.lang_code,
+        volume_multiplier=request.volume_multiplier,
+        normalization_options=request.normalization_options,
+        allow_voice_tags=True,  # always on here
+        voice_aliases=request.voice_aliases,
+    )
+    return await create_speech(
+        request=speech_request,
+        client_request=client_request,
+        x_raw_response=None,
+    )
+
+
 @router.post("/dev/captioned_speech")
 async def create_captioned_speech(
     request: CaptionedSpeechRequest,
@@ -167,10 +216,30 @@ async def create_captioned_speech(
 ):
     """Generate audio with word-level timestamps using streaming approach"""
 
+    if request.allow_voice_tags:
+        require_voice_tags_enabled()
+
+    if request.ssml:
+        await apply_ssml(request)
+
     try:
         # model_name = get_model_name(request.model)
         tts_service = await get_tts_service()
-        voice_name = await process_and_validate_voices(request.voice, tts_service)
+        voice_name = await process_and_validate_voices(
+            request.voice, tts_service, request.voice_aliases
+        )
+        # resolved here, not in the generator, so a bad tag 400s before the stream opens
+        request.input = await process_and_validate_voice_tags(
+            request.input, tts_service, request.allow_voice_tags, request.voice_aliases
+        )
+        apply_alias_rate(request)
+        # checked post-SSML and pre-stream, so an over-budget request 400s before headers
+        check_pause_budget(request.input)
+        check_speakable(
+            request.input,
+            request.allow_voice_tags,
+            request.normalization_options,
+        )
 
         # Set content type based on format
         content_type = {
@@ -187,7 +256,7 @@ async def create_captioned_speech(
         if request.stream:
             # Create generator but don't start it yet
             generator = stream_audio_chunks(
-                tts_service, request, client_request, writer
+                tts_service, request, client_request, writer, voice_name
             )
 
             # If download link requested, wrap generator with temp file writer
@@ -255,6 +324,7 @@ async def create_captioned_speech(
                         # Ensure temp writer is closed
                         if not temp_writer._finalized:
                             await temp_writer.__aexit__(None, None, None)
+                        await generator.aclose()
                         writer.close()
 
                 # Stream with temp file writing
@@ -298,8 +368,10 @@ async def create_captioned_speech(
 
                 except Exception as e:
                     logger.error(f"Error in single output streaming: {e}")
-                    writer.close()
                     raise
+                finally:
+                    await generator.aclose()
+                    writer.close()
 
             # Standard streaming without download link
             return JSONStreamingResponse(
@@ -323,24 +395,10 @@ async def create_captioned_speech(
                 volume_multiplier=request.volume_multiplier,
                 normalization_options=request.normalization_options,
                 lang_code=request.lang_code,
+                allow_voice_tags=request.allow_voice_tags,
+                output_format=request.response_format,
             )
-
-            audio_data = await AudioService.convert_audio(
-                audio_data,
-                request.response_format,
-                writer,
-                is_last_chunk=False,
-                trim_audio=False,
-            )
-
-            # Convert to requested format with proper finalization
-            final = await AudioService.convert_audio(
-                AudioChunk(np.array([], dtype=np.int16)),
-                request.response_format,
-                writer,
-                is_last_chunk=True,
-            )
-            output = audio_data.output + final.output
+            output = audio_data.output
 
             base64_output = base64.b64encode(output).decode("utf-8")
 
@@ -423,9 +481,16 @@ async def unload_model(
     The model reloads automatically on the next inference request.
     Useful for homelab deployments where GPU memory is shared across services.
     """
+    if not settings.allow_dev_unload:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "The /dev/unload endpoint is disabled"},
+        )
     try:
         if tts_service.model_manager is None:
-            raise HTTPException(status_code=503, detail={"error": "Model manager not initialized"})
+            raise HTTPException(
+                status_code=503, detail={"error": "Model manager not initialized"}
+            )
         await tts_service.model_manager.unload()
         return JSONResponse({"status": "unloaded"})
     except HTTPException:
@@ -433,3 +498,50 @@ async def unload_model(
     except Exception as e:
         logger.error(f"Error unloading model: {e}")
         raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/dev/reload")
+async def reload_model(
+    tts_service: TTSService = Depends(get_tts_service),
+):
+    """Reload the model immediately.
+
+    Normal inference also reloads lazily after an unload; this endpoint is useful
+    when you want to pre-warm the model before the next request.
+    """
+    if not settings.allow_dev_unload:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "The /dev/reload endpoint is disabled"},
+        )
+    try:
+        if tts_service.model_manager is None:
+            raise HTTPException(
+                status_code=503, detail={"error": "Model manager not initialized"}
+            )
+        await tts_service.model_manager.reload()
+        return JSONResponse(
+            {"status": "loaded", "model": tts_service.model_manager.status()}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reloading model: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/dev/model")
+async def model_status(
+    tts_service: TTSService = Depends(get_tts_service),
+):
+    """Return model load state and auto-unload settings."""
+    if not settings.allow_dev_unload:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "The /dev/model endpoint is disabled"},
+        )
+    if tts_service.model_manager is None:
+        raise HTTPException(
+            status_code=503, detail={"error": "Model manager not initialized"}
+        )
+    return JSONResponse(tts_service.model_manager.status())

@@ -2,10 +2,10 @@
 FastAPI OpenAI Compatible API
 """
 
+import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import torch
 import uvicorn
@@ -13,10 +13,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from .core.config import settings
+from .core.config import settings, unrecognized_env_file_keys
 from .routers.debug import router as debug_router
 from .routers.development import router as dev_router
 from .routers.openai_compatible import router as openai_router
+from .routers.ssml import router as ssml_router
+from .routers.tune import router as tune_router
 from .routers.web_player import router as web_router
 
 
@@ -48,6 +50,10 @@ def setup_logger():
 # Configure logger
 setup_logger()
 
+# unknown keys are ignored rather than fatal, so name them or a typo'd setting fails silently
+for _key in unrecognized_env_file_keys():
+    logger.warning(f"ignoring unrecognized env file key: {_key}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,6 +81,14 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize model: {e}")
         raise
 
+    if settings.enable_inno_tuner:
+        from .inference import inno_tuner
+
+        try:
+            await asyncio.to_thread(inno_tuner.load)
+        except Exception as e:
+            logger.error(f"Inno voice tuner not loaded, /dev/tune will answer 503: {e}")
+
     boundary = "░" * 2 * 12
     startup_msg = f"""
 
@@ -97,6 +111,10 @@ async def lifespan(app: FastAPI):
     else:
         startup_msg += "\nRunning on CPU"
     startup_msg += f"\n{voicepack_count} voice packs loaded"
+    if settings.enable_inno_tuner:
+        startup_msg += "\nInno voice tuner: " + (
+            "ready at /dev/tune" if inno_tuner.available() else "not available"
+        )
 
     # Add web player info if enabled
     if settings.enable_web_player:
@@ -127,7 +145,7 @@ if settings.cors_enabled:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -135,7 +153,9 @@ if settings.cors_enabled:
 # Include routers
 app.include_router(openai_router, prefix="/v1")
 app.include_router(dev_router)  # Development endpoints
-app.include_router(debug_router)  # Debug endpoints
+app.include_router(ssml_router)  # SSML translation and capabilities
+app.include_router(tune_router)  # /dev/tune, 403 unless enabled
+app.include_router(debug_router)  # Debug endpoints (403 unless enabled)
 if settings.enable_web_player:
     app.include_router(web_router, prefix="/web")  # Web player static files
 

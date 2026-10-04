@@ -1,6 +1,7 @@
 """Clean Kokoro implementation with controlled resource management."""
 
 import os
+import tempfile
 from typing import AsyncGenerator, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -13,6 +14,91 @@ from ..core.config import settings
 from ..core.model_config import model_config
 from ..structures.schemas import WordTimestamp
 from .base import AudioChunk, BaseModelBackend
+
+_ESPEAK_TS_SCALE = (
+    2.0 / 80.0
+)  # pred_dur unit -> seconds (matches KPipeline.join_timestamps)
+
+
+def _espeak_word_timestamps(graphemes, phonemes, pred_dur, g2p=None):
+    """Derive word timestamps for espeak-based (non-English) pipelines.
+
+    KPipeline attaches timed tokens only for English (misaki G2P) voices, but
+    the model predicts a duration for every phoneme in every language (the
+    audio is rendered from exactly those durations). pred_dur[0] is BOS and
+    pred_dur[1 + i] covers phonemes[i], so summing per-character durations and
+    splitting at the phoneme string's spaces yields exact word times.
+
+    Words espeak expands into several spoken words (numbers, some
+    abbreviations) are reconciled by re-phonemizing per word via `g2p`; if the
+    counts still disagree, returns None so the caller emits no timestamps and
+    clients can fall back to their own handling.
+    """
+    try:
+        if pred_dur is None or not phonemes or len(pred_dur) < len(phonemes) + 1:
+            return None
+        words = graphemes.split()
+        if not words:
+            return None
+        durations = [dur * _ESPEAK_TS_SCALE for dur in pred_dur.tolist()]
+        groups = []  # [start, end) seconds per space-separated phoneme group
+        now = durations[0]
+        start = None
+        for i, ch in enumerate(phonemes):
+            if ch.isspace():
+                if start is not None:
+                    groups.append((start, now))
+                    start = None
+            elif start is None:
+                start = now
+            now += durations[1 + i]
+        if start is not None:
+            groups.append((start, now))
+
+        if len(groups) != len(words):
+            if g2p is None:
+                return None
+            counts = []
+            for word in words:
+                phones = g2p(word)
+                if isinstance(phones, tuple):
+                    phones = phones[0]
+                counts.append(max(len((phones or "").split()), 1))
+            if sum(counts) != len(groups):
+                return None
+            merged, group_idx = [], 0
+            for count in counts:
+                merged.append((groups[group_idx][0], groups[group_idx + count - 1][1]))
+                group_idx += count
+            groups = merged
+
+        return [
+            WordTimestamp(word=word, start_time=round(start, 3), end_time=round(end, 3))
+            for word, (start, end) in zip(words, groups)
+        ]
+    except Exception as e:
+        logger.warning(f"espeak timestamp mapping failed: {e}")
+        return None
+
+
+def _configure_rocm_backend() -> None:
+    """Disable MIOpen on ROCm.
+
+    MIOpen compiles a kernel per unseen tensor shape, and Kokoro's decoder
+    length varies with the input text, so nearly every request pays that
+    compile: 2433ms per generation against 268ms without, on gfx1100.
+    warmup_miopen.py does not help, as shape is not a function of phoneme
+    count.
+
+    ENABLE_MIOPEN=true keeps MIOpen. CUDA is unaffected.
+    """
+    if not torch.version.hip:
+        return
+    if settings.enable_miopen:
+        logger.info("MIOpen left enabled via ENABLE_MIOPEN")
+        return
+    torch.backends.cudnn.enabled = False
+    logger.info("ROCm detected: MIOpen disabled to avoid per-shape kernel compilation")
 
 
 class KokoroV1(BaseModelBackend):
@@ -44,6 +130,18 @@ class KokoroV1(BaseModelBackend):
             logger.debug(f"Cached voice tensor from {voice_path}")
         return self._voice_cache[cache_key]
 
+    def forget_voice(self, voice_path: str) -> None:
+        """Drop a pack's cached tensor and the temp copy generate() wrote for the pipeline."""
+        for key in [k for k in self._voice_cache if k.startswith(f"{voice_path}:")]:
+            del self._voice_cache[key]
+        temp_copy = os.path.join(
+            tempfile.gettempdir(), f"temp_voice_{os.path.basename(voice_path)}"
+        )
+        for pipeline in self._pipelines.values():
+            pipeline.voices.pop(temp_copy, None)
+        if os.path.exists(temp_copy):
+            os.remove(temp_copy)
+
     async def load_model(self, path: str) -> None:
         """Load pre-baked model.
 
@@ -66,7 +164,9 @@ class KokoroV1(BaseModelBackend):
             logger.info(f"Model path: {model_path}")
 
             # Load model and let KModel handle device mapping
-            self._model = KModel(config=config_path, model=model_path).eval()
+            self._model = KModel(
+                repo_id=settings.model_repo_id, config=config_path, model=model_path
+            ).eval()
             # For MPS, manually move ISTFT layers to CPU while keeping rest on MPS
             if self._device == "mps":
                 logger.info(
@@ -74,6 +174,8 @@ class KokoroV1(BaseModelBackend):
                 )
                 self._model = self._model.to(torch.device("mps"))
             elif self._device == "cuda":
+                # ROCm reports device "cuda", so this is the ROCm path too.
+                _configure_rocm_backend()
                 self._model = self._model.cuda()
             else:
                 self._model = self._model.cpu()
@@ -98,7 +200,10 @@ class KokoroV1(BaseModelBackend):
         if lang_code not in self._pipelines:
             logger.info(f"Creating new pipeline for language code: {lang_code}")
             self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code, model=self._model, device=self._device
+                lang_code=lang_code,
+                repo_id=settings.model_repo_id,
+                model=self._model,
+                device=self._device,
             )
         return self._pipelines[lang_code]
 
@@ -308,6 +413,8 @@ class KokoroV1(BaseModelBackend):
                                         continue
                                     if not token.text or not token.text.strip():
                                         continue
+                                    if token.start_ts is None or token.end_ts is None:
+                                        continue
 
                                     start_time = float(token.start_ts) + current_offset
                                     end_time = float(token.end_ts) + current_offset
@@ -326,6 +433,28 @@ class KokoroV1(BaseModelBackend):
                                 logger.error(
                                     f"Failed to process timestamps for chunk: {e}"
                                 )
+                    elif (
+                        return_timestamps
+                        and result.phonemes
+                        and type(getattr(pipeline, "g2p", None)).__name__ == "EspeakG2P"
+                    ):
+                        # espeak pipelines (es/fr/it/hi/pt) yield no timed
+                        # tokens; derive word times from the model's own
+                        # phoneme durations instead. Espeak-only: other
+                        # non-English G2Ps (ja/zh) have no space-separated
+                        # word groups to map.
+                        pred_dur = getattr(result, "pred_dur", None)
+                        if (
+                            pred_dur is None
+                            and getattr(result, "output", None) is not None
+                        ):
+                            pred_dur = getattr(result.output, "pred_dur", None)
+                        word_timestamps = _espeak_word_timestamps(
+                            result.graphemes,
+                            result.phonemes,
+                            pred_dur,
+                            g2p=getattr(pipeline, "g2p", None),
+                        )
 
                     yield AudioChunk(
                         result.audio.numpy(), word_timestamps=word_timestamps

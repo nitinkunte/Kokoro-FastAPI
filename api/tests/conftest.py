@@ -1,16 +1,19 @@
 import os
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
 import pytest_asyncio
 import torch
+from hypothesis import settings
 
 from api.src.inference.model_manager import ModelManager
 from api.src.inference.voice_manager import VoiceManager
 from api.src.services.tts_service import TTSService
-from api.src.structures.model_schemas import VoiceConfig
+
+settings.register_profile("dev", max_examples=300, deadline=None)
+settings.register_profile("ci", max_examples=500, deadline=None, derandomize=True)
+settings.load_profile("ci" if os.environ.get("CI") else "dev")
 
 
 @pytest.fixture
@@ -52,7 +55,6 @@ async def mock_voice_manager(mock_voice_tensor):
     manager.get_voice_path = MagicMock(return_value="/mock/path/voice.pt")
     manager.load_voice = AsyncMock(return_value=mock_voice_tensor)
     manager.list_voices = AsyncMock(return_value=["voice1", "voice2"])
-    manager.combine_voices = AsyncMock(return_value="voice1_voice2")
     return manager
 
 

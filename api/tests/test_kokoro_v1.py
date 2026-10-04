@@ -1,12 +1,13 @@
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
-import numpy as np
 import pytest
 import torch
 
-from api.src.inference.kokoro_v1 import KokoroV1
+from api.src.core.config import settings
+from api.src.inference.kokoro_v1 import KokoroV1, _configure_rocm_backend
 
 
 @pytest.fixture
@@ -98,7 +99,10 @@ def test_get_pipeline_creates_new(kokoro_backend):
 
         # Should create new pipeline with correct params
         mock_kpipeline.assert_called_once_with(
-            lang_code="e", model=kokoro_backend._model, device=kokoro_backend._device
+            lang_code="e",
+            repo_id=settings.model_repo_id,
+            model=kokoro_backend._model,
+            device=kokoro_backend._device,
         )
         assert pipeline_e == mock_pipeline
         assert kokoro_backend._pipelines["e"] == mock_pipeline
@@ -158,3 +162,131 @@ async def test_generate_uses_correct_pipeline(kokoro_backend):
             voice_arg = Path(mock_pipeline.call_args[1]["voice"])
             assert voice_arg.name == "temp_voice_ef_voice"
             assert voice_arg.parent == Path(tempfile.gettempdir())
+
+
+@pytest.mark.asyncio
+async def test_generate_skips_untimed_tokens(kokoro_backend):
+    """A token misaki gave no phonemes has no start_ts; later words keep their timestamps (issue #249)."""
+    kokoro_backend._model = MagicMock()
+    tokens = [
+        SimpleNamespace(text="What", start_ts=0.0, end_ts=0.2),
+        SimpleNamespace(text="--", start_ts=None, end_ts=None),
+        SimpleNamespace(text=" ", start_ts=0.2, end_ts=0.3),
+        SimpleNamespace(text="key", start_ts=0.3, end_ts=0.5),
+        SimpleNamespace(text="tail"),
+    ]
+    result = SimpleNamespace(
+        audio=torch.zeros(24000), tokens=tokens, pred_dur=torch.ones(8), phonemes=""
+    )
+
+    with (
+        patch("api.src.core.paths.load_voice_tensor", return_value=torch.ones(1)),
+        patch("api.src.core.paths.save_voice_tensor"),
+    ):
+        mock_pipeline = MagicMock(return_value=iter([result]))
+        with patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline):
+            chunks = [
+                c
+                async for c in kokoro_backend.generate(
+                    "What--key", "af_voice", lang_code="a", return_timestamps=True
+                )
+            ]
+
+    assert [t.word for t in chunks[0].word_timestamps] == ["What", "key"]
+
+
+def test_espeak_word_timestamps_basic():
+    """Word times derived from pred_dur for an espeak (non-English) result."""
+    from api.src.inference.kokoro_v1 import _espeak_word_timestamps
+
+    # phonemes "ab cd": BOS=8, a=4, b=4, space=8, c=4, d=4, EOS=0
+    # scale is 2/80 s per unit -> BOS 0.2s, each char 0.1s, space 0.2s
+    pred_dur = torch.tensor([8, 4, 4, 8, 4, 4, 0])
+    ts = _espeak_word_timestamps("hola mundo", "ab cd", pred_dur)
+
+    assert [t.word for t in ts] == ["hola", "mundo"]
+    assert ts[0].start_time == pytest.approx(0.2)
+    assert ts[0].end_time == pytest.approx(0.4)
+    assert ts[1].start_time == pytest.approx(0.6)
+    assert ts[1].end_time == pytest.approx(0.8)
+
+
+def test_espeak_word_timestamps_expansion():
+    """Words espeak expands (numbers) are merged back via per-word g2p."""
+    from api.src.inference.kokoro_v1 import _espeak_word_timestamps
+
+    # Three text words but four phoneme groups ("1863" speaks as two words).
+    phonemes = "a bb cc d"
+    pred_dur = torch.tensor([0, 4] + [8, 4, 4] + [8, 4, 4] + [8, 4] + [0])
+
+    def g2p(word):
+        return ("bb cc" if word == "1863" else "x", None)
+
+    ts = _espeak_word_timestamps("en 1863 el", phonemes, pred_dur, g2p=g2p)
+
+    assert [t.word for t in ts] == ["en", "1863", "el"]
+    # "1863" spans both expanded groups.
+    assert ts[1].start_time == pytest.approx(0.3)
+    assert ts[1].end_time == pytest.approx(0.9)
+    # Whole-string timing stays monotonic and inside the clip.
+    assert ts[0].end_time <= ts[1].start_time <= ts[2].start_time
+
+
+def test_espeak_word_timestamps_unreconcilable():
+    """Group/word count mismatch that g2p can't explain yields None."""
+    from api.src.inference.kokoro_v1 import _espeak_word_timestamps
+
+    phonemes = "a b c"
+    pred_dur = torch.tensor([0, 4, 8, 4, 8, 4, 0])
+
+    # g2p says every word is a single group: 2 != 3 -> give up.
+    ts = _espeak_word_timestamps("uno dos", phonemes, pred_dur, g2p=lambda w: (w, None))
+    assert ts is None
+
+    # No g2p available -> also None.
+    assert _espeak_word_timestamps("uno dos", phonemes, pred_dur) is None
+
+
+def test_espeak_word_timestamps_degenerate_inputs():
+    """Missing durations or empty text return None instead of raising."""
+    from api.src.inference.kokoro_v1 import _espeak_word_timestamps
+
+    assert _espeak_word_timestamps("hola", "abc", None) is None
+    assert _espeak_word_timestamps("hola", "", torch.tensor([0, 0])) is None
+    assert _espeak_word_timestamps("", "abc", torch.tensor([0, 4, 4, 4, 0])) is None
+    # pred_dur too short for the phoneme string.
+    assert _espeak_word_timestamps("hola", "abcdef", torch.tensor([0, 4])) is None
+
+
+@pytest.fixture
+def restore_cudnn():
+    """Restore the global flag that _configure_rocm_backend mutates."""
+    previous = torch.backends.cudnn.enabled
+    yield
+    torch.backends.cudnn.enabled = previous
+
+
+def test_configure_rocm_backend_noop_on_cuda(restore_cudnn, monkeypatch):
+    """A CUDA build must keep cuDNN enabled."""
+    monkeypatch.setattr(torch.version, "hip", None)
+    torch.backends.cudnn.enabled = True
+    _configure_rocm_backend()
+    assert torch.backends.cudnn.enabled is True
+
+
+def test_configure_rocm_backend_disables_miopen_on_rocm(restore_cudnn, monkeypatch):
+    """A ROCm build disables MIOpen to avoid per-shape kernel compilation."""
+    monkeypatch.setattr(torch.version, "hip", "7.2.0")
+    monkeypatch.setattr(settings, "enable_miopen", False)
+    torch.backends.cudnn.enabled = True
+    _configure_rocm_backend()
+    assert torch.backends.cudnn.enabled is False
+
+
+def test_configure_rocm_backend_opt_out(restore_cudnn, monkeypatch):
+    """ENABLE_MIOPEN keeps MIOpen active."""
+    monkeypatch.setattr(torch.version, "hip", "7.2.0")
+    monkeypatch.setattr(settings, "enable_miopen", True)
+    torch.backends.cudnn.enabled = True
+    _configure_rocm_backend()
+    assert torch.backends.cudnn.enabled is True

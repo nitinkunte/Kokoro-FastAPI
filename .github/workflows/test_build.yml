@@ -31,6 +31,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+
 concurrency:
   group: test-build-${{ inputs.branch_name }}
   cancel-in-progress: true
@@ -79,7 +82,7 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.branch_name }}
 
@@ -88,19 +91,15 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           driver-opts: image=moby/buildkit:v0.21.1
 
       - name: Build image
         run: |
           TARGET="${{ matrix.build_target }}-${{ matrix.platform }}"
-          CACHE_ARGS=(
-            --set "*.cache-from=type=gha,scope=${TARGET}"
-            --set "*.cache-to=type=gha,mode=max,scope=${TARGET}"
-          )
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            docker buildx bake "$TARGET" --print "${CACHE_ARGS[@]}"
+            docker buildx bake "$TARGET" --print
           else
-            docker buildx bake "$TARGET" --progress=plain "${CACHE_ARGS[@]}"
+            docker buildx bake "$TARGET" --progress=plain
           fi

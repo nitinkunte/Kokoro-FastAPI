@@ -4,8 +4,7 @@ import io
 import json
 import os
 import time
-from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
+from typing import Callable, List, Optional, Set
 
 import aiofiles
 import aiofiles.os
@@ -13,6 +12,39 @@ import torch
 from loguru import logger
 
 from .config import settings
+
+_CONTENT_TYPES = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".json": "application/json",
+    ".css": "text/css",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    # real media types so the webui can play downloads directly (#150)
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".opus": "audio/opus",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".pcm": "audio/pcm",
+}
+
+
+_API_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+def models_dir() -> str:
+    return os.path.join(_API_DIR, settings.model_dir)
+
+
+def voices_dir() -> str:
+    return os.path.join(_API_DIR, settings.voices_dir)
 
 
 async def _find_file(
@@ -28,21 +60,24 @@ async def _find_file(
         filter_fn: Optional function to filter files
 
     Returns:
-        Absolute path to file
+        Resolved absolute path to file
 
     Raises:
-        RuntimeError: If file not found
+        FileNotFoundError: If no readable file is found inside a search path
     """
-    if os.path.isabs(filename) and await aiofiles.os.path.exists(filename):
-        return filename
-
     for path in search_paths:
-        full_path = os.path.join(path, filename)
-        if await aiofiles.os.path.exists(full_path):
+        root = os.path.realpath(path)
+        prefix = root if root.endswith(os.sep) else root + os.sep
+        candidate = os.path.normpath(os.path.join(root, filename))
+        if not candidate.startswith(prefix):
+            logger.warning(f"Rejected path outside {root}: {filename}")
+            continue
+        full_path = os.path.realpath(candidate)
+        if await aiofiles.os.path.isfile(full_path):
             if filter_fn is None or filter_fn(full_path):
                 return full_path
 
-    raise FileNotFoundError(f"File not found: {filename} in paths: {search_paths}")
+    raise FileNotFoundError(f"File not found: {filename}")
 
 
 async def _scan_directories(
@@ -86,15 +121,9 @@ async def get_model_path(model_name: str) -> str:
         Absolute path to model file
 
     Raises:
-        RuntimeError: If model not found
+        FileNotFoundError: If model not found
     """
-    # Get api directory path (two levels up from core)
-    api_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
-    # Construct model directory path relative to api directory
-    model_dir = os.path.join(api_dir, settings.model_dir)
-
-    # Ensure model directory exists
+    model_dir = models_dir()
     os.makedirs(model_dir, exist_ok=True)
 
     # Search in model directory
@@ -114,15 +143,9 @@ async def get_voice_path(voice_name: str) -> str:
         Absolute path to voice file
 
     Raises:
-        RuntimeError: If voice not found
+        FileNotFoundError: If voice not found
     """
-    # Get api directory path
-    api_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
-    # Construct voice directory path relative to api directory
-    voice_dir = os.path.join(api_dir, settings.voices_dir)
-
-    # Ensure voice directory exists
+    voice_dir = voices_dir()
     os.makedirs(voice_dir, exist_ok=True)
 
     voice_file = f"{voice_name}.pt"
@@ -140,13 +163,7 @@ async def list_voices() -> List[str]:
     Returns:
         List of voice names (without .pt extension)
     """
-    # Get api directory path
-    api_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
-    # Construct voice directory path relative to api directory
-    voice_dir = os.path.join(api_dir, settings.voices_dir)
-
-    # Ensure voice directory exists
+    voice_dir = voices_dir()
     os.makedirs(voice_dir, exist_ok=True)
 
     # Search in voice directory
@@ -157,7 +174,7 @@ async def list_voices() -> List[str]:
         return name.endswith(".pt")
 
     voices = await _scan_directories(search_paths, filter_voice_files)
-    return sorted([name[:-3] for name in voices])  # Remove .pt extension
+    return sorted([name.removesuffix(".pt") for name in voices])
 
 
 async def load_voice_tensor(
@@ -228,7 +245,7 @@ async def load_model_weights(path: str, device: str = "cpu") -> dict:
     """Load model weights asynchronously.
 
     Args:
-        path: Path to model file (.pth or .onnx)
+        path: Path to model file (.pth)
         device: Device to load model to
 
     Returns:
@@ -293,7 +310,7 @@ async def get_web_file_path(filename: str) -> str:
         Absolute path to file
 
     Raises:
-        RuntimeError: If file not found
+        FileNotFoundError: If file not found
     """
     # Get project root directory (four levels up from core to get to project root)
     root_dir = os.path.dirname(
@@ -320,27 +337,7 @@ async def get_content_type(path: str) -> str:
         Content type string
     """
     ext = os.path.splitext(path)[1].lower()
-    return {
-        ".html": "text/html",
-        ".js": "application/javascript",
-        ".css": "text/css",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".svg": "image/svg+xml",
-        ".ico": "image/x-icon",
-        # audio downloads: serve a real media type so the webui can play the file
-        # directly (the player swaps to this URL once generation finishes, #150).
-        ".mp3": "audio/mpeg",
-        ".wav": "audio/wav",
-        ".opus": "audio/opus",
-        ".flac": "audio/flac",
-        ".aac": "audio/aac",
-        ".m4a": "audio/mp4",
-        ".ogg": "audio/ogg",
-        ".pcm": "audio/pcm",
-    }.get(ext, "application/octet-stream")
+    return _CONTENT_TYPES.get(ext, "application/octet-stream")
 
 
 async def verify_model_path(model_path: str) -> bool:

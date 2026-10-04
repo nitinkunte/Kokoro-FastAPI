@@ -1,3 +1,6 @@
+const SPEED_MIN = 0.1;
+const SPEED_MAX = 4;
+
 export class PlayerControls {
     constructor(audioService, playerState) {
         this.audioService = audioService;
@@ -6,8 +9,7 @@ export class PlayerControls {
             playPauseBtn: document.getElementById('play-pause-btn'),
             seekSlider: document.getElementById('seek-slider'),
             volumeSlider: document.getElementById('volume-slider'),
-            speedSlider: document.getElementById('speed-slider'),
-            speedValue: document.getElementById('speed-value'),
+            speedInput: document.getElementById('speed-input'),
             timeDisplay: document.getElementById('time-display'),
             cancelBtn: document.getElementById('cancel-btn')
         };
@@ -24,9 +26,11 @@ export class PlayerControls {
             return '0:00';
         }
 
-        const minutes = Math.floor(secs / 60);
+        const hours = Math.floor(secs / 3600);
+        const minutes = Math.floor((secs % 3600) / 60);
         const seconds = Math.floor(secs % 60);
-        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        const mmss = `${hours ? minutes.toString().padStart(2, '0') : minutes}:${seconds.toString().padStart(2, '0')}`;
+        return hours ? `${hours}:${mmss}` : mmss;
     }
 
     startTimeUpdate() {
@@ -47,10 +51,11 @@ export class PlayerControls {
         const currentTime = this.audioService.getCurrentTime();
         const duration = this.audioService.getDuration();
         
-        // Update time display
-        this.elements.timeDisplay.textContent = 
-            `${this.formatTime(currentTime)} / ${this.formatTime(duration || 0)}`;
-        
+        const known = Number.isFinite(duration) && duration > 0;
+        this.elements.timeDisplay.textContent = known
+            ? `${this.formatTime(currentTime)} / ${this.formatTime(duration)}`
+            : this.formatTime(currentTime);
+
         // Update seek slider
         if (Number.isFinite(duration) && duration > 0 && !this.elements.seekSlider.dragging) {
             this.elements.seekSlider.value = (currentTime / duration) * 100;
@@ -70,12 +75,16 @@ export class PlayerControls {
             }
         });
 
-        // Seek slider
-        this.elements.seekSlider.addEventListener('mousedown', () => {
+        // Seek slider (pointer events cover mouse and touch drags)
+        this.elements.seekSlider.addEventListener('pointerdown', () => {
             this.elements.seekSlider.dragging = true;
         });
 
-        this.elements.seekSlider.addEventListener('mouseup', () => {
+        this.elements.seekSlider.addEventListener('pointerup', () => {
+            this.elements.seekSlider.dragging = false;
+        });
+
+        this.elements.seekSlider.addEventListener('pointercancel', () => {
             this.elements.seekSlider.dragging = false;
         });
 
@@ -93,37 +102,53 @@ export class PlayerControls {
             this.playerState.setVolume(volume);
         });
 
-        // Speed slider
-        this.elements.speedSlider.addEventListener('input', (e) => {
+        this.elements.speedInput.addEventListener('input', (e) => {
             const speed = parseFloat(e.target.value);
-            this.elements.speedValue.textContent = speed.toFixed(1);
+            if (speed >= SPEED_MIN && speed <= SPEED_MAX) {
+                this.playerState.setSpeed(speed);
+            }
+        });
+
+        this.elements.speedInput.addEventListener('change', (e) => {
+            const parsed = parseFloat(e.target.value);
+            const speed = Number.isFinite(parsed)
+                ? Math.min(SPEED_MAX, Math.max(SPEED_MIN, parsed))
+                : this.playerState.getState().speed;
             this.playerState.setSpeed(speed);
+            e.target.value = speed.toFixed(1);
         });
 
         // Cancel button
         this.elements.cancelBtn.addEventListener('click', () => {
             this.audioService.cancel();
-            this.playerState.reset();
-            this.updateControls({ isGenerating: false });
             this.stopTimeUpdate();
+            this.playerState.reset();
         });
+    }
+
+    setPlayIcon(playing) {
+        const btn = this.elements.playPauseBtn;
+        const label = playing ? 'Pause' : 'Play';
+        btn.classList.toggle('playing', playing);
+        btn.setAttribute('aria-label', label);
+        btn.setAttribute('title', label);
     }
 
     setupAudioEvents() {
         this.audioService.addEventListener('play', () => {
-            this.elements.playPauseBtn.textContent = 'Pause';
+            this.setPlayIcon(true);
             this.playerState.setPlaying(true);
             this.startTimeUpdate();
         });
 
         this.audioService.addEventListener('pause', () => {
-            this.elements.playPauseBtn.textContent = 'Play';
+            this.setPlayIcon(false);
             this.playerState.setPlaying(false);
             this.stopTimeUpdate();
         });
 
         this.audioService.addEventListener('ended', () => {
-            this.elements.playPauseBtn.textContent = 'Play';
+            this.setPlayIcon(false);
             this.playerState.setPlaying(false);
             this.stopTimeUpdate();
         });
@@ -131,6 +156,7 @@ export class PlayerControls {
         this.audioService.addEventListener('ready', () => {
             this.playerState.setReady(true);
             this.updateTimeDisplay();
+            this.updateControls(this.playerState.getState());
         });
 
         // Initial time display
@@ -144,7 +170,9 @@ export class PlayerControls {
     updateControls(state) {
         // Update button states
         this.elements.playPauseBtn.disabled = !state.isReady && !state.isGenerating;
-        this.elements.seekSlider.disabled = !state.isReady || !Number.isFinite(state.duration) || state.duration <= 0;
+        const known = state.isReady && Number.isFinite(state.duration) && state.duration > 0;
+        this.elements.seekSlider.disabled = !known || !this.audioService.isSeekable();
+        this.elements.seekSlider.classList.toggle('no-duration', !known);
         this.elements.cancelBtn.style.display = state.isGenerating ? 'block' : 'none';
         
         // Update volume and speed if changed externally
@@ -152,9 +180,9 @@ export class PlayerControls {
             this.elements.volumeSlider.value = state.volume * 100;
         }
         
-        if (this.elements.speedSlider.value !== state.speed.toString()) {
-            this.elements.speedSlider.value = state.speed;
-            this.elements.speedValue.textContent = state.speed.toFixed(1);
+        if (document.activeElement !== this.elements.speedInput
+            && parseFloat(this.elements.speedInput.value) !== state.speed) {
+            this.elements.speedInput.value = state.speed.toFixed(1);
         }
     }
 
@@ -167,7 +195,7 @@ export class PlayerControls {
             this.playerState.reset();
         }
         // Reset UI elements
-        this.elements.playPauseBtn.textContent = 'Play';
+        this.setPlayIcon(false);
         this.elements.playPauseBtn.disabled = true;
         this.elements.seekSlider.value = 0;
         this.elements.seekSlider.disabled = true;

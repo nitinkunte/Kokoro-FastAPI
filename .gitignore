@@ -10,7 +10,9 @@ __pycache__/
 *$py.class
 .Python
 .pytest_cache
+.hypothesis
 .coverage
+coverage.xml
 .coveragerc
 
 # Python package build artifacts
@@ -39,14 +41,21 @@ ENV/
 
 *.pth
 *.tar*
+api/src/models/**/*.download
 
 
 # Other project files
 .env
 .claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/api-contrib/
+!.claude/skills/web-contrib/
+!.claude/skills/readme-benchmarks/
+!.claude/skills/integration-tests/
+!.claude/skills/adding-normalizer/
 .agents/*
 Kokoro-82M/
-ui/data/
 EXTERNAL_UV_DOCUMENTATION*
 app
 api/temp_files/
@@ -59,6 +68,7 @@ examples/ebook_test/parse_epub.py
 api/src/voices/af_jadzia.pt
 examples/assorted_checks/test_combinations/output/*
 examples/assorted_checks/test_openai/output/*
+examples/assorted_checks/test_dialogue/output/*
 
 
 # Audio files
@@ -71,6 +81,8 @@ examples/*.ogg
 examples/speech.mp3
 examples/phoneme_examples/output/*.wav
 examples/assorted_checks/benchmarks/output_audio/*
+examples/assorted_checks/benchmarks/output_audio_stream/*
+examples/assorted_checks/benchmarks/output_audio_stream_openai/*
 examples/assorted_checks/test_transcription/output/*.wav
 examples/assorted_checks/test_transcription/output_long_form/*.log
 examples/assorted_checks/test_transcription/output_long_form/*.transcript.txt
@@ -81,8 +93,7 @@ examples/assorted_checks/benchmarks/output_data/model_unload_stats.txt
 examples/assorted_checks/benchmarks/output_data/model_unload_results.json
 examples/assorted_checks/benchmarks/output_plots/model_unload_longform.png
 examples/assorted_checks/benchmarks/output_plots/model_unload_short.png
-uv.lock
-!docker/test-client/uv.lock
+examples/uv.lock
 
 # Mac MPS virtualenv for dual testing
 .venv-mps
@@ -94,9 +105,7 @@ pyproject.toml.bkp
 examples/assorted_checks/test_silence/out/*
 playwright-report/
 test-results/
-kokoro-web/src/.DS_Store
-ui/.DS_Store
-web/src/.DS_Store
-web/tests/.DS_Store
-web/.DS_Store
-.DS_Store
+ROCM_TRIM.md
+Kokoro-FastAPI.code-workspace
+experiments/*
+api/src/models/v1_0/inno_tuner/

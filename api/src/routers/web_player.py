@@ -8,6 +8,7 @@ from loguru import logger
 
 from ..core.config import settings
 from ..core.paths import get_content_type, get_web_file_path, read_bytes
+from ..inference import inno_tuner
 
 router = APIRouter(
     tags=["Web Player"],
@@ -26,6 +27,8 @@ async def get_web_config():
     return {
         "root_path": root_path,
         "version": settings.api_version,
+        "tuner": inno_tuner.available(),
+        "voice_saving": settings.allow_local_voice_saving,
     }
 
 
@@ -57,9 +60,9 @@ async def serve_web_file(filename: str):
             },
         )
 
-    except RuntimeError as e:
+    except (FileNotFoundError, RuntimeError):  # RuntimeError from read_bytes
         logger.warning(f"Web file not found: {filename}")
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail="Not found")
     except Exception as e:
         logger.error(f"Error serving web file {filename}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
